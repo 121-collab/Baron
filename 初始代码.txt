@@ -1,0 +1,771 @@
+############################################################
+# Baron et al., 2016 — Human & Mouse Pancreas scRNA-seq
+# 复现主脚本（基于 GSE84133_RAW 中的 UMI 计数矩阵）
+############################################################
+
+#############################
+# 0. 参数 & 路径
+#############################
+
+DATA_DIR <- "D:/scRNAseq/GSE84133_RAW"    # TODO: 改成你自己的路径
+OUT_DIR  <- file.path(DATA_DIR, "results")
+
+SEED   <- 123
+N_HVG  <- 2000
+PCS    <- 30
+DIMS   <- 1:15
+RES    <- 0.5
+
+QC_MIN_GENES <- 500
+QC_MAX_GENES <- 6000
+QC_MAX_MT    <- 0.10
+QC_MAD_CLIP  <- TRUE
+
+#############################
+# 1. 加载包
+#############################
+
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(Matrix)
+  library(Seurat)
+  library(ggplot2)
+  library(patchwork)
+  library(dplyr)
+  library(pheatmap)
+  library(tidyr)
+})
+## 可选：把用户库切到你之前用的 D 盘
+dir.create("D:/Rlibs_new", showWarnings = FALSE)
+.libPaths(c("D:/Rlibs_new", .libPaths()))
+
+install.packages(c("R.utils", "R.oo", "R.methodsS3"), dependencies = TRUE)
+
+set.seed(SEED)
+setwd(DATA_DIR)
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE)
+
+#############################
+# 2. 工具函数
+#############################
+
+# 兼容 Seurat v4/v5：统一获取 counts / data
+get_counts <- function(obj, assay = DefaultAssay(obj)) {
+  a <- obj[[assay]]
+  if ("layers" %in% slotNames(a)) {
+    GetAssayData(obj, assay = assay, layer = "counts")
+  } else {
+    GetAssayData(obj, assay = assay, slot  = "counts")
+  }
+}
+
+get_data <- function(obj, assay = DefaultAssay(obj)) {
+  a <- obj[[assay]]
+  if ("layers" %in% slotNames(a)) {
+    GetAssayData(obj, assay = assay, layer = "data")
+  } else {
+    GetAssayData(obj, assay = assay, slot  = "data")
+  }
+}
+
+# 从文件名提取 donor ID
+get_sample_id <- function(file, species = c("human","mouse")) {
+  species <- match.arg(species)
+  bn <- basename(file)
+  m <- regexpr(paste0(species, "[0-9]+"), bn, ignore.case = TRUE)
+  if (m > 0) {
+    id <- substr(bn, m, m + attr(m, "match.length") - 1)
+  } else {
+    id <- strsplit(bn, "_")[[1]][1]
+  }
+  id <- gsub("human","H",id,ignore.case = TRUE)
+  id <- gsub("mouse","M",id,ignore.case = TRUE)
+  id
+}
+
+# 读取一个 Baron csv.gz
+read_baron_file <- function(file) {
+  message("Reading: ", basename(file))
+  DT <- fread(file, header = TRUE, check.names = FALSE, data.table = TRUE)
+  
+  nm_raw <- names(DT)
+  nm_low <- tolower(trimws(nm_raw))
+  
+  # 删除完全空的首列
+  if (nm_low[1] %in% c("", "v1")) {
+    v1 <- DT[[1]]
+    if (all(is.na(v1) | v1 == "")) {
+      DT <- DT[, -1, with = FALSE]
+      nm_raw <- names(DT)
+      nm_low <- tolower(trimws(nm_raw))
+    }
+  }
+  
+  # barcode 列
+  bcol <- which(nm_low == "barcode")
+  if (length(bcol) != 1) {
+    stop("未找到唯一 barcode 列：", paste(nm_raw, collapse = ", "))
+  }
+  barcodes <- as.character(DT[[bcol]])
+  keep <- !(is.na(barcodes) | barcodes == "")
+  if (any(!keep)) {
+    DT <- DT[keep]
+    barcodes <- barcodes[keep]
+  }
+  if (any(duplicated(barcodes))) {
+    keep2 <- !duplicated(barcodes)
+    DT <- DT[keep2]
+    barcodes <- barcodes[keep2]
+  }
+  
+  # 去掉 assigned_cluster 列
+  ccol <- which(nm_low == "assigned_cluster")
+  drop_idx <- unique(c(bcol, ccol))
+  expr_DT <- if (length(drop_idx) > 0) DT[, -drop_idx, with = FALSE] else DT
+  
+  # 转数值
+  expr_DF <- as.data.frame(lapply(expr_DT, function(x)
+    suppressWarnings(as.numeric(as.character(x)))))
+  expr_DF[is.na(expr_DF)] <- 0
+  nz <- which(colSums(expr_DF) > 0)
+  expr_DF <- expr_DF[, nz, drop = FALSE]
+  
+  M <- as.matrix(expr_DF)      # 行=细胞  列=基因
+  genes <- colnames(M)
+  if (is.null(genes)) genes <- paste0("gene_", seq_len(ncol(M)))
+  
+  Mt <- t(M)                   # gene × cell
+  rownames(Mt) <- make.unique(genes)
+  colnames(Mt) <- make.unique(barcodes)
+  Matrix(Mt, sparse = TRUE)
+}
+
+# 合并重复基因名
+aggregate_by_rownames <- function(smat) {
+  mt <- as(smat, "dgTMatrix")
+  dt <- data.table(
+    gene = rownames(smat)[mt@i + 1],
+    j    = mt@j + 1,
+    x    = mt@x
+  )
+  dt2 <- dt[, .(x = sum(x)), by = .(gene, j)]
+  uniq_genes <- unique(dt2$gene)
+  sparseMatrix(
+    i = match(dt2$gene, uniq_genes),
+    j = dt2$j,
+    x = dt2$x,
+    dims = c(length(uniq_genes), ncol(smat)),
+    dimnames = list(uniq_genes, colnames(smat))
+  )
+}
+
+# 修正行列名
+fix_dimnames <- function(smat) {
+  rn <- rownames(smat)
+  rn[is.na(rn) | rn == ""] <- paste0("gene_", seq_len(sum(is.na(rn) | rn == "")))
+  rownames(smat) <- make.unique(rn)
+  cn <- colnames(smat)
+  cn[is.na(cn) | cn == ""] <- paste0("cell_", seq_len(sum(is.na(cn) | cn == "")))
+  colnames(smat) <- make.unique(cn)
+  smat
+}
+
+# 基因名匹配（忽略大小写）
+match_features <- function(obj, genes) {
+  rn   <- rownames(obj)
+  rn_l <- tolower(rn)
+  g_l  <- tolower(genes)
+  idx  <- match(g_l, rn_l)
+  found  <- rn[!is.na(idx)]
+  missed <- genes[is.na(idx)]
+  if (length(missed) > 0) {
+    message("以下基因没找到，将忽略：", paste(missed, collapse = ", "))
+  }
+  found
+}
+
+mt_genes <- function(genes)  genes[grepl("^MT-|^mt-|^mt\\.", genes)]
+rb_genes <- function(genes)  genes[grepl("^RPL|^RPS|^rpl|^rps", genes)]
+
+mad_keep <- function(x, k = 3) {
+  med <- median(x, na.rm = TRUE)
+  md  <- mad(x, constant = 1.4826, na.rm = TRUE)
+  x >= (med - k * md) & x <= (med + k * md)
+}
+
+#############################
+# 3. 读取 human / mouse 计数矩阵
+#############################
+
+human_files <- list.files(pattern = "human.*\\.csv\\.gz$", full.names = TRUE)
+mouse_files <- list.files(pattern = "mouse.*\\.csv\\.gz$", full.names = TRUE)
+
+if (length(human_files) == 0) {
+  stop("没有找到 human*.csv.gz，请检查 DATA_DIR / 解压路径。")
+}
+
+## human
+human_list       <- list()
+human_sample_ids <- character(0)
+
+for (i in seq_along(human_files)) {
+  f   <- human_files[i]
+  sid <- get_sample_id(f, "human")
+  mat <- read_baron_file(f)
+  colnames(mat) <- paste(sid, colnames(mat), sep = "_")
+  human_list[[i]]     <- mat
+  human_sample_ids[i] <- sid
+}
+
+if (length(human_list) > 1) {
+  g_h <- Reduce(intersect, lapply(human_list, rownames))
+  human_list <- lapply(human_list, function(m) m[g_h, , drop = FALSE])
+}
+
+human_mat <- do.call(cbind, human_list)
+human_mat <- fix_dimnames(aggregate_by_rownames(human_mat))
+
+human_sample_vec <- unlist(mapply(
+  FUN   = function(m, sid) rep(sid, ncol(m)),
+  m     = human_list,
+  sid   = human_sample_ids,
+  SIMPLIFY = FALSE
+))
+names(human_sample_vec) <- colnames(human_mat)
+
+## mouse（如果有）
+mouse_mat        <- NULL
+mouse_sample_vec <- NULL
+
+if (length(mouse_files) > 0) {
+  mouse_list       <- list()
+  mouse_sample_ids <- character(0)
+  
+  for (i in seq_along(mouse_files)) {
+    f   <- mouse_files[i]
+    sid <- get_sample_id(f, "mouse")
+    mat <- read_baron_file(f)
+    colnames(mat) <- paste(sid, colnames(mat), sep = "_")
+    mouse_list[[i]]     <- mat
+    mouse_sample_ids[i] <- sid
+  }
+  
+  if (length(mouse_list) > 1) {
+    g_m <- Reduce(intersect, lapply(mouse_list, rownames))
+    mouse_list <- lapply(mouse_list, function(m) m[g_m, , drop = FALSE])
+  }
+  
+  mouse_mat <- do.call(cbind, mouse_list)
+  mouse_mat <- fix_dimnames(aggregate_by_rownames(mouse_mat))
+  
+  mouse_sample_vec <- unlist(mapply(
+    FUN   = function(m, sid) rep(sid, ncol(m)),
+    m     = mouse_list,
+    sid   = mouse_sample_ids,
+    SIMPLIFY = FALSE
+  ))
+  names(mouse_sample_vec) <- colnames(mouse_mat)
+}
+
+#############################
+# 4. QC + Seurat 主流程
+#############################
+
+qc_and_make_seurat <- function(smat, species_label = "human",
+                               sample_vec = NULL) {
+  message("====== QC for ", species_label, " ======")
+  
+  md <- data.frame(
+    row.names = colnames(smat),
+    species   = species_label,
+    sample    = if (!is.null(sample_vec)) sample_vec[colnames(smat)] else species_label,
+    stringsAsFactors = FALSE
+  )
+  
+  obj <- CreateSeuratObject(
+    counts = smat,
+    project = paste0("Baron_", species_label),
+    meta.data = md,
+    min.cells = 0,
+    min.features = 0
+  )
+  obj$orig.ident <- obj$sample
+  
+  counts <- get_counts(obj)
+  genes  <- rownames(counts)
+  mt_set <- mt_genes(genes)
+  rb_set <- rb_genes(genes)
+  
+  nFeature <- Matrix::colSums(counts > 0)
+  nCount   <- Matrix::colSums(counts)
+  pct_mt   <- if (length(mt_set) > 0) Matrix::colSums(counts[mt_set, , drop = FALSE]) / pmax(nCount, 1) * 100 else rep(0, ncol(counts))
+  pct_rb   <- if (length(rb_set) > 0) Matrix::colSums(counts[rb_set, , drop = FALSE]) / pmax(nCount, 1) * 100 else rep(0, ncol(counts))
+  
+  obj$nFeature_RNA <- nFeature
+  obj$nCount_RNA   <- nCount
+  obj$percent.mt   <- pct_mt
+  obj$percent.ribo <- pct_rb
+  
+  keep1 <- (nFeature >= QC_MIN_GENES) &
+    (nFeature <= QC_MAX_GENES) &
+    (pct_mt  <= QC_MAX_MT * 100)
+  
+  if (QC_MAD_CLIP) {
+    keep2 <- rep(TRUE, ncol(obj))
+    for (id in unique(obj$sample)) {
+      idx <- which(obj$sample == id)
+      keep2[idx] <- mad_keep(nFeature[idx]) &
+        mad_keep(nCount[idx]) &
+        mad_keep(pct_mt[idx])
+    }
+    keep <- keep1 & keep2
+  } else {
+    keep <- keep1
+  }
+  
+  message("Cells before QC: ", ncol(obj),
+          " | after QC: ", sum(keep))
+  obj <- subset(obj, cells = colnames(obj)[keep])
+  
+  counts2 <- get_counts(obj)
+  keep_genes <- Matrix::rowSums(counts2 > 0) >= 3
+  obj <- obj[keep_genes, ]
+  
+  obj <- NormalizeData(obj, verbose = FALSE)
+  obj <- FindVariableFeatures(obj, nfeatures = N_HVG, verbose = FALSE)
+  obj <- ScaleData(obj, verbose = FALSE)
+  obj <- RunPCA(obj, npcs = PCS, verbose = FALSE)
+  obj <- FindNeighbors(obj, dims = DIMS)
+  obj <- FindClusters(obj, resolution = RES)
+  obj <- RunUMAP(obj, dims = DIMS, verbose = FALSE)
+  obj <- RunTSNE(obj, dims = DIMS, check_duplicates = FALSE)
+  
+  obj
+}
+
+human <- qc_and_make_seurat(human_mat, "human", human_sample_vec)
+saveRDS(human, file.path(OUT_DIR, "human_seurat_qc.rds"))
+
+if (!is.null(mouse_mat)) {
+  mouse <- qc_and_make_seurat(mouse_mat, "mouse", mouse_sample_vec)
+  saveRDS(mouse, file.path(OUT_DIR, "mouse_seurat_qc.rds"))
+}
+
+#############################
+# 5. marker 注释 & celltype_final
+#############################
+
+pancreas_markers <- list(
+  Alpha      = c("GCG"),
+  Beta       = c("INS"),
+  Delta      = c("SST"),
+  PP         = c("PPY"),
+  Acinar     = c("PRSS1","CPA1"),
+  Ductal     = c("KRT19","MUC1","CFTR"),
+  Endothelial= c("PECAM1","VWF"),
+  Stellate   = c("COL1A1","RGS5"),
+  Immune     = c("PTPRC","LYZ","CD74")
+)
+
+annotate_pancreas <- function(obj, marker_list, slot_name = "celltype_major") {
+  scored_lists <- lapply(marker_list, function(gs) match_features(obj, gs))
+  keep <- vapply(scored_lists, length, integer(1)) > 0
+  scored_lists <- scored_lists[keep]
+  if (length(scored_lists) == 0) stop("在此对象中 marker 都匹配不到。")
+  
+  obj <- AddModuleScore(obj, features = scored_lists,
+                        name = paste0(slot_name, "_score"))
+  score_cols <- grep(paste0("^", slot_name, "_score"), colnames(obj@meta.data), value = TRUE)
+  score_mat  <- as.matrix(obj@meta.data[, score_cols, drop = FALSE])
+  
+  max_idx  <- apply(score_mat, 1, which.max)
+  ct_names <- names(scored_lists)[max_idx]
+  max_val  <- apply(score_mat, 1, max)
+  ct_names[max_val < 0] <- "Unknown"
+  
+  obj[[slot_name]] <- factor(ct_names)
+  obj
+}
+
+human <- annotate_pancreas(human, pancreas_markers, slot_name = "celltype_major")
+ if (exists("mouse")) {
+  mouse <- annotate_pancreas(mouse, pancreas_markers, slot_name = "celltype_major")
+}
+
+# 最终 celltype
+human$celltype_final <- human$celltype_major
+if (exists("mouse")) {
+  mouse$celltype_final <- mouse$celltype_major
+}
+
+# 统一 celltype 顺序
+ct_order <- c("Alpha","Beta","Delta","PP","Ductal","Acinar",
+              "Endothelial","Stellate","Immune","Unknown")
+human$celltype_final <- factor(as.character(human$celltype_final), levels = ct_order)
+if (exists("mouse")) {
+  mouse$celltype_final <- factor(as.character(mouse$celltype_final), levels = ct_order)
+}
+
+# 统一主题
+theme_baron <- function(base = 10){
+  theme_bw(base_size = base) +
+    theme(
+      panel.grid = element_blank(),
+      strip.background = element_rect(fill = "grey92", color = NA),
+      strip.text = element_text(face = "bold"),
+      plot.title = element_text(face = "bold", hjust = 0.5, size = base + 2),
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+    )
+}
+
+#############################
+# 6. 基本可视化（UMAP / tSNE）
+#############################
+
+p_h_umap <- DimPlot(human, group.by = "celltype_final",
+                    reduction = "umap", label = TRUE, repel = TRUE,
+                    label.size = 3, pt.size = 0.25) +
+  ggtitle("Human — UMAP by cell type") + theme_baron()
+print(p_h_umap)
+
+p_h_tsne <- DimPlot(human, group.by = "celltype_final",
+                    reduction = "tsne", label = TRUE, repel = TRUE,
+                    label.size = 3, pt.size = 0.25) +
+  ggtitle("Human — tSNE by cell type") + theme_baron()
+print(p_h_tsne)
+
+if (exists("mouse")) {
+  p_m_umap <- DimPlot(mouse, group.by = "celltype_final",
+                      reduction = "umap", label = TRUE, repel = TRUE,
+                      label.size = 3, pt.size = 0.25) +
+    ggtitle("Mouse — UMAP by cell type") + theme_baron()
+  print(p_m_umap)
+}
+
+#############################
+# 7. DotPlot：论文 Fig1B/C 风格
+#############################
+
+genes_h_panel <- c(
+  "INS","GCG","SST","PPY",         # endocrine
+  "KRT19","MUC1","CFTR",           # ductal
+  "PRSS1","CPA1",                  # acinar
+  "PECAM1","VWF",                  # endothelial
+  "COL1A1","RGS5",                 # stellate
+  "PTPRC","LYZ"                    # immune
+)
+feat_h <- match_features(human, genes_h_panel)
+
+dp_h <- DotPlot(human, features = feat_h, group.by = "celltype_final",
+                dot.scale = 5, cols = c("grey90","dodgerblue4"),
+                col.min = 0, col.max = 2) +
+  RotatedAxis() +
+  ggtitle("Human — canonical markers by cell type") +
+  theme_baron()
+print(dp_h)
+
+if (exists("mouse")) {
+  genes_m_panel <- c("Ins1","Ins2","Gcg","Sst","Ppy",
+                     "Krt19","Muc1","Cftr",
+                     "Prss1","Cpa1",
+                     "Pecam1","Vwf",
+                     "Col1a1","Rgs5",
+                     "Ptprc","Lyz2")
+  feat_m <- match_features(mouse, genes_m_panel)
+  dp_m <- DotPlot(mouse, features = feat_m, group.by = "celltype_final",
+                  dot.scale = 5, cols = c("grey90","dodgerblue4"),
+                  col.min = 0, col.max = 2) +
+    RotatedAxis() +
+    ggtitle("Mouse — canonical markers by cell type") +
+    theme_baron()
+  print(dp_m)
+}
+
+#############################
+# 8. Top markers 热图（每群 Top5）
+#############################
+
+Idents(human) <- human$celltype_final
+markers_h <- FindAllMarkers(human, only.pos = TRUE,
+                            logfc.threshold = 0.25,
+                            min.pct = 0.25)
+write.csv(markers_h,
+          file.path(OUT_DIR, "Markers_Human_byCelltype.csv"),
+          row.names = FALSE)
+
+topN <- 5
+top_h <- markers_h %>% group_by(cluster) %>% top_n(n = topN, wt = avg_log2FC)
+genes_h <- unique(top_h$gene)
+
+human <- ScaleData(human, features = genes_h, verbose = FALSE)
+ht_h <- DoHeatmap(human, features = genes_h, group.by = "celltype_final",
+                  slot = "scale.data", raster = TRUE, label = FALSE) +
+  ggtitle(paste0("Human — Top", topN, " markers per cell type")) +
+  theme_baron()
+print(ht_h)
+
+if (exists("mouse")) {
+  Idents(mouse) <- mouse$celltype_final
+  markers_m <- FindAllMarkers(mouse, only.pos = TRUE,
+                              logfc.threshold = 0.25,
+                              min.pct = 0.25)
+  write.csv(markers_m,
+            file.path(OUT_DIR, "Markers_Mouse_byCelltype.csv"),
+            row.names = FALSE)
+  
+  top_m <- markers_m %>% group_by(cluster) %>% top_n(n = topN, wt = avg_log2FC)
+  genes_m <- unique(top_m$gene)
+  mouse <- ScaleData(mouse, features = genes_m, verbose = FALSE)
+  ht_m <- DoHeatmap(mouse, features = genes_m, group.by = "celltype_final",
+                    slot = "scale.data", raster = TRUE, label = FALSE) +
+    ggtitle(paste0("Mouse — Top", topN, " markers per cell type")) +
+    theme_baron()
+  print(ht_m)
+}
+
+#############################
+# 9. Fig2：donor × celltype 相关性热图
+#############################
+
+avg_by_donor_celltype <- function(obj,
+                                  celltype_col = "celltype_final",
+                                  assay = "RNA") {
+  mat <- get_data(obj, assay = assay)
+  md  <- obj@meta.data
+  group <- paste(md$sample, md[[celltype_col]], sep = "_")
+  groups <- unique(group)
+  
+  res_list <- lapply(groups, function(g) {
+    cells <- colnames(mat)[group == g]
+    if (length(cells) < 3) return(NULL)
+    rowMeans(mat[, cells, drop = FALSE])
+  })
+  names(res_list) <- groups
+  res_list <- res_list[!vapply(res_list, is.null, logical(1))]
+  res_mat <- do.call(cbind, res_list)
+  colnames(res_mat) <- names(res_list)
+  res_mat
+}
+
+plot_corr_heatmap <- function(avg_mat, title = ""){
+  cormat <- cor(avg_mat, method = "pearson", use = "pairwise.complete.obs")
+  tmp <- strsplit(colnames(cormat), "_")
+  donor <- sapply(tmp, `[`, 1)
+  ctype <- sapply(tmp, `[`, 2)
+  anno  <- data.frame(donor = donor, celltype = ctype,
+                      row.names = colnames(cormat))
+  pheatmap(cormat,
+           clustering_method = "average",
+           annotation_row = anno,
+           annotation_col = anno,
+           color = colorRampPalette(c("#4575B4","#E0F3F8",
+                                      "#FFFFBF","#FEE090","#D73027"))(100),
+           treeheight_row = 10, treeheight_col = 10,
+           fontsize = 9, main = title)
+}
+
+avg_h <- avg_by_donor_celltype(human)
+plot_corr_heatmap(avg_h, "Human donor × cell type — Pearson correlation")
+
+if (exists("mouse")) {
+  avg_m <- avg_by_donor_celltype(mouse)
+  get_ct <- function(x) sapply(strsplit(colnames(x), "_"), `[`, 2)
+  ct_h <- get_ct(avg_h)
+  ct_m <- get_ct(avg_m)
+  common_ct <- intersect(unique(ct_h), unique(ct_m))
+  
+  avg_h2 <- avg_h[, ct_h %in% common_ct, drop = FALSE]
+  avg_m2 <- avg_m[, ct_m %in% common_ct, drop = FALSE]
+  
+  colnames(avg_h2) <- paste0("H_", colnames(avg_h2))
+  colnames(avg_m2) <- paste0("M_", colnames(avg_m2))
+  avg_all <- cbind(avg_h2, avg_m2)
+  plot_corr_heatmap(avg_all,
+                    "Human + Mouse common cell types — Pearson correlation")
+}
+
+#############################
+# 10. Fig5/6：ductal / beta PC1 分析
+#############################
+
+# 子集 PCA
+pca_for_celltype <- function(obj,
+                             target_ct = "Ductal",
+                             celltype_col = "celltype_final",
+                             npcs = 30) {
+  sub <- subset(obj, cells = rownames(obj@meta.data)[obj@meta.data[[celltype_col]] == target_ct])
+  message(target_ct, " cells: ", ncol(sub))
+  sub <- NormalizeData(sub, verbose = FALSE)
+  sub <- FindVariableFeatures(sub, verbose = FALSE)
+  sub <- ScaleData(sub, verbose = FALSE)
+  sub <- RunPCA(sub, npcs = npcs, verbose = FALSE)
+  sub
+}
+
+# PC1 上的 moving average
+moving_average_along_pc1 <- function(obj, genes,
+                                     n_bins = 30,
+                                     assay = "RNA") {
+  genes <- match_features(obj, genes)
+  if (length(genes) == 0) {
+    message("没有匹配到任何基因，跳过 moving average。")
+    return(NULL)
+  }
+  pc1 <- Embeddings(obj, "pca")[, 1]
+  data_mat <- get_data(obj, assay = assay)
+  brks <- seq(min(pc1), max(pc1), length.out = n_bins + 1)
+  bin_id <- cut(pc1, breaks = brks, include.lowest = TRUE, labels = FALSE)
+  profiles <- lapply(genes, function(g) {
+    tapply(as.numeric(data_mat[g, ]), bin_id, mean, na.rm = TRUE)
+  })
+  names(profiles) <- genes
+  prof_df <- as.data.frame(profiles)
+  prof_df$bin <- seq_len(nrow(prof_df))
+  prof_long <- pivot_longer(prof_df, cols = all_of(genes),
+                            names_to = "gene", values_to = "expr")
+  prof_long
+}
+
+# PC1 loading 热图
+pc1_heatmap <- function(obj, top_n = 40,
+                        assay = "RNA",
+                        n_bins = 30,
+                        title = "") {
+  loadings <- Loadings(obj[["pca"]])[, 1]
+  ord <- order(abs(loadings), decreasing = TRUE)[1:top_n]
+  genes <- names(loadings)[ord]
+  genes <- match_features(obj, genes)
+  if (length(genes) == 0) {
+    message("没有匹配到任何基因，跳过 PC1 热图。")
+    return(invisible(NULL))
+  }
+  pc1 <- Embeddings(obj, "pca")[, 1]
+  data_mat <- get_data(obj, assay = assay)
+  brks <- seq(min(pc1), max(pc1), length.out = n_bins + 1)
+  bin_id <- cut(pc1, breaks = brks, include.lowest = TRUE, labels = FALSE)
+  prof_list <- lapply(genes, function(g) {
+    tapply(as.numeric(data_mat[g, ]), bin_id, mean, na.rm = TRUE)
+  })
+  prof_mat <- do.call(cbind, prof_list)
+  rownames(prof_mat) <- paste0("bin", seq_len(nrow(prof_mat)))
+  colnames(prof_mat) <- genes
+  prof_scaled <- t(scale(t(prof_mat)))
+  pheatmap(prof_scaled,
+           cluster_rows = FALSE,
+           cluster_cols = TRUE,
+           main = title, fontsize = 8)
+}
+
+## 10.1 Ductal（Fig5）
+
+duct_genes_h <- c("MUC1","CFTR","TFF1","TFF2","CD44","PLAT")
+duct_genes_h <- match_features(human, duct_genes_h)
+duct_h <- pca_for_celltype(human, target_ct = "Ductal")
+
+# PCA 上分面显示 marker
+p_list_duct <- lapply(duct_genes_h, function(g){
+  FeaturePlot(duct_h, features = g, reduction = "pca",
+              dims = c(1,2), pt.size = 0.5) +
+    ggtitle(g) + theme_baron()
+})
+print(wrap_plots(p_list_duct, ncol = 3))
+
+# PC1 moving average
+ma_duct <- moving_average_along_pc1(duct_h, duct_genes_h, n_bins = 30)
+if (!is.null(ma_duct)) {
+  p_ma_duct <- ggplot(ma_duct, aes(x = bin, y = expr)) +
+    geom_line(color = "firebrick", linewidth = 0.7) +
+    facet_wrap(~ gene, scales = "free_y", ncol = 3) +
+    labs(x = "PC1 bin", y = "Mean log-normalized expression",
+         title = "Human ductal — moving average along PC1") +
+    theme_baron()
+  print(p_ma_duct)
+}
+
+pc1_heatmap(duct_h, top_n = 40,
+            title = "Human ductal — genes with high PC1 loading")
+
+## 10.2 Beta（Fig6）
+
+beta_h <- subset(human,
+                 subset = celltype_final == "Beta" & nCount_RNA >= 3000)
+beta_h <- NormalizeData(beta_h, verbose = FALSE)
+beta_h <- FindVariableFeatures(beta_h, verbose = FALSE)
+beta_h <- ScaleData(beta_h, verbose = FALSE)
+beta_h <- RunPCA(beta_h, npcs = 30, verbose = FALSE)
+
+# PCA 上按 nCount_RNA 着色
+p_beta_pca <- FeaturePlot(beta_h, features = "nCount_RNA",
+                          reduction = "pca", dims = c(1,2)) +
+  ggtitle("Beta — PCA colored by nCount_RNA") + theme_baron()
+print(p_beta_pca)
+
+beta_genes_h <- c("HSPA5","MAFA","HERPUD1","DDIT3","UCN3")
+beta_genes_h <- match_features(beta_h, beta_genes_h)
+
+ma_beta <- moving_average_along_pc1(beta_h, beta_genes_h, n_bins = 30)
+if (!is.null(ma_beta)) {
+  p_ma_beta <- ggplot(ma_beta, aes(x = bin, y = expr)) +
+    geom_line(color = "steelblue4", linewidth = 0.7) +
+    facet_wrap(~ gene, scales = "free_y", ncol = 5) +
+    labs(x = "PC1 bin", y = "Mean log-normalized expression",
+         title = "Beta — moving average along PC1") +
+    theme_baron()
+  print(p_ma_beta)
+}
+
+pc1_heatmap(beta_h, top_n = 40, title = "Beta — genes with high PC1 loading")
+
+#############################
+# 11. Stellate 额外分析（Fig4 思路）
+#############################
+
+stellate_h <- subset(human, subset = celltype_final == "Stellate")
+if (ncol(stellate_h) > 10) {
+  stellate_h <- NormalizeData(stellate_h, verbose = FALSE)
+  stellate_h <- FindVariableFeatures(stellate_h, verbose = FALSE)
+  stellate_h <- ScaleData(stellate_h, verbose = FALSE)
+  stellate_h <- RunPCA(stellate_h, npcs = 20, verbose = FALSE)
+  stellate_h <- FindNeighbors(stellate_h, dims = 1:10)
+  stellate_h <- FindClusters(stellate_h, resolution = 0.4)
+  stellate_h <- RunUMAP(stellate_h, dims = 1:10)
+  
+  DimPlot(stellate_h, reduction = "umap", label = TRUE, repel = TRUE,
+          pt.size = 0.4) +
+    ggtitle("Human stellate — subclusters") + theme_baron()
+  
+  stellate_genes <- c("PDGFRA","PDGFRB","COL1A1","COL1A2",
+                      "ACTA2","TAGLN","VIM",
+                      "IL6","CCL2","CCL3","CCL4","CXCL8")
+  stellate_genes <- match_features(stellate_h, stellate_genes)
+  stellate_h <- ScaleData(stellate_h, features = stellate_genes, verbose = FALSE)
+  DoHeatmap(stellate_h, features = stellate_genes,
+            group.by = "seurat_clusters", raster = TRUE, label = FALSE) +
+    ggtitle("Human stellate — activation/immune markers") +
+    theme_baron()
+}
+
+#############################
+# 12. 记录运行环境
+#############################
+
+saveRDS(list(
+  cfg = list(
+    DATA_DIR = DATA_DIR,
+    OUT_DIR  = OUT_DIR,
+    SEED     = SEED,
+    N_HVG    = N_HVG,
+    PCS      = PCS,
+    DIMS     = DIMS,
+    RES      = RES,
+    QC_MIN_GENES = QC_MIN_GENES,
+    QC_MAX_GENES = QC_MAX_GENES,
+    QC_MAX_MT    = QC_MAX_MT,
+    QC_MAD_CLIP  = QC_MAD_CLIP
+  ),
+  session = sessionInfo()
+), file = file.path(OUT_DIR, "run_metadata.rds"))
+
+message("✅ 全流程完成，结果已写入：", normalizePath(OUT_DIR))
+

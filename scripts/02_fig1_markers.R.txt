@@ -1,0 +1,182 @@
+#!/usr/bin/env Rscript
+
+## ============================================================
+## 02_fig1_markers.R
+## Fig1: UMAP/tSNE + canonical marker DotPlot + Top markers heatmap
+## for Human and Mouse.
+## ============================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(ggplot2)
+  library(pheatmap)
+  library(patchwork)
+})
+
+PROJECT_DIR <- "/data/projects/genebiotec_wushujun/Baron_GSE84133"
+RES_H       <- file.path(PROJECT_DIR, "results_human_paper")
+RES_M       <- file.path(PROJECT_DIR, "results_mouse_paper")
+
+human <- readRDS(file.path(RES_H, "Human_seurat_celltyped.rds"))
+mouse <- if (file.exists(file.path(RES_M, "Mouse_seurat_celltyped.rds"))) {
+  readRDS(file.path(RES_M, "Mouse_seurat_celltyped.rds"))
+} else NULL
+
+theme_baron <- function(base = 10){
+  theme_bw(base_size = base) +
+    theme(
+      panel.grid = element_blank(),
+      strip.background = element_rect(fill = "grey92", color = NA),
+      strip.text = element_text(face = "bold"),
+      plot.title = element_text(face = "bold", hjust = 0.5, size = base + 2),
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+    )
+}
+
+match_features <- function(obj, genes) {
+  rn   <- rownames(obj)
+  rn_l <- tolower(rn)
+  g_l  <- tolower(genes)
+  idx  <- match(g_l, rn_l)
+  found  <- rn[!is.na(idx)]
+  missed <- genes[is.na(idx)]
+  if (length(missed) > 0) {
+    message("以下基因没找到，将忽略：", paste(missed, collapse = ", "))
+  }
+  found
+}
+
+## -------- Human: UMAP / tSNE --------
+
+pdf(file.path(RES_H, "Human_UMAP_celltype_paper.pdf"), width = 6, height = 5)
+print(
+  DimPlot(human, group.by = "celltype_final",
+          reduction = "umap", label = TRUE, repel = TRUE,
+          label.size = 3, pt.size = 0.25) +
+    ggtitle("Human — UMAP by cell type") + theme_baron()
+)
+dev.off()
+
+pdf(file.path(RES_H, "Human_tSNE_celltype_paper.pdf"), width = 6, height = 5)
+print(
+  DimPlot(human, group.by = "celltype_final",
+          reduction = "tsne", label = TRUE, repel = TRUE,
+          label.size = 3, pt.size = 0.25) +
+    ggtitle("Human — tSNE by cell type") + theme_baron()
+)
+dev.off()
+
+## -------- Human: canonical DotPlot --------
+
+genes_h_panel <- c(
+  "INS","GCG","SST","PPY",
+  "KRT19","MUC1","CFTR",
+  "PRSS1","CPA1",
+  "PECAM1","VWF",
+  "COL1A1","RGS5",
+  "PTPRC","LYZ"
+)
+feat_h <- match_features(human, genes_h_panel)
+
+pdf(file.path(RES_H, "Human_DotPlot_markers_paper.pdf"), width = 7, height = 4)
+print(
+  DotPlot(human, features = feat_h, group.by = "celltype_final",
+          dot.scale = 5, cols = c("grey90","dodgerblue4"),
+          col.min = 0, col.max = 2) +
+    RotatedAxis() +
+    ggtitle("Human — canonical markers by cell type") +
+    theme_baron()
+)
+dev.off()
+
+## -------- Human: Top markers heatmap --------
+
+Idents(human) <- human$celltype_final
+markers_h <- FindAllMarkers(human, only.pos = TRUE,
+                            logfc.threshold = 0.25,
+                            min.pct = 0.25)
+write.csv(markers_h,
+          file.path(RES_H, "Markers_Human_byCelltype.csv"),
+          row.names = FALSE)
+
+topN   <- 5
+top_h  <- markers_h %>% group_by(cluster) %>% top_n(n = topN, wt = avg_log2FC)
+genes_h <- unique(top_h$gene)
+human   <- ScaleData(human, features = genes_h, verbose = FALSE)
+
+pdf(file.path(RES_H, "Human_TopMarkers_Heatmap_paper.pdf"), width = 7, height = 5)
+print(
+  DoHeatmap(human, features = genes_h, group.by = "celltype_final",
+            slot = "scale.data", raster = TRUE, label = FALSE) +
+    ggtitle(paste0("Human — Top", topN, " markers per cell type")) +
+    theme_baron()
+)
+dev.off()
+
+## -------- Mouse 部分（如果有） --------
+
+if (!is.null(mouse)) {
+
+  pdf(file.path(RES_M, "Mouse_UMAP_celltype_paper.pdf"), width = 6, height = 5)
+  print(
+    DimPlot(mouse, group.by = "celltype_final",
+            reduction = "umap", label = TRUE, repel = TRUE,
+            label.size = 3, pt.size = 0.25) +
+      ggtitle("Mouse — UMAP by cell type") + theme_baron()
+  )
+  dev.off()
+
+  pdf(file.path(RES_M, "Mouse_tSNE_celltype_paper.pdf"), width = 6, height = 5)
+  print(
+    DimPlot(mouse, group.by = "celltype_final",
+            reduction = "tsne", label = TRUE, repel = TRUE,
+            label.size = 3, pt.size = 0.25) +
+      ggtitle("Mouse — tSNE by cell type") + theme_baron()
+  )
+  dev.off()
+
+  genes_m_panel <- c(
+    "Ins1","Ins2","Gcg","Sst","Ppy",
+    "Krt19","Muc1","Cftr",
+    "Prss1","Cpa1",
+    "Pecam1","Vwf",
+    "Col1a1","Rgs5",
+    "Ptprc","Lyz2"
+  )
+  feat_m <- match_features(mouse, genes_m_panel)
+
+  pdf(file.path(RES_M, "Mouse_DotPlot_markers_paper.pdf"), width = 7, height = 4)
+  print(
+    DotPlot(mouse, features = feat_m, group.by = "celltype_final",
+            dot.scale = 5, cols = c("grey90","dodgerblue4"),
+            col.min = 0, col.max = 2) +
+      RotatedAxis() +
+      ggtitle("Mouse — canonical markers by cell type") +
+      theme_baron()
+  )
+  dev.off()
+
+  Idents(mouse) <- mouse$celltype_final
+  markers_m <- FindAllMarkers(mouse, only.pos = TRUE,
+                              logfc.threshold = 0.25,
+                              min.pct = 0.25)
+  write.csv(markers_m,
+            file.path(RES_M, "Markers_Mouse_byCelltype.csv"),
+            row.names = FALSE)
+
+  top_m   <- markers_m %>% group_by(cluster) %>% top_n(n = topN, wt = avg_log2FC)
+  genes_m <- unique(top_m$gene)
+  mouse   <- ScaleData(mouse, features = genes_m, verbose = FALSE)
+
+  pdf(file.path(RES_M, "Mouse_TopMarkers_Heatmap_paper.pdf"), width = 7, height = 5)
+  print(
+    DoHeatmap(mouse, features = genes_m, group.by = "celltype_final",
+              slot = "scale.data", raster = TRUE, label = FALSE) +
+      ggtitle(paste0("Mouse — Top", topN, " markers per cell type")) +
+      theme_baron()
+  )
+  dev.off()
+}
+
+message("✅ 02_fig1_markers.R 完成。")

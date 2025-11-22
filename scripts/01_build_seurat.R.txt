@@ -1,0 +1,334 @@
+#!/usr/bin/env Rscript
+
+## ============================================================
+## 01_build_seurat.R
+## 读取 GSE84133_RAW csv.gz，构建 Human & Mouse Seurat 对象，
+## 做 QC / 标准 Seurat 流程 / 细胞类型注释，并保存为 RDS。
+## ============================================================
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(Matrix)
+  library(Seurat)
+  library(dplyr)
+})
+
+## ---------------- 参数 & 路径 ----------------
+
+PROJECT_DIR <- "/data/projects/genebiotec_wushujun/Baron_GSE84133"  # 按需修改
+
+RAW_DIR     <- file.path(PROJECT_DIR, "GSE84133_RAW")
+RES_H       <- file.path(PROJECT_DIR, "results_human_paper")
+RES_M       <- file.path(PROJECT_DIR, "results_mouse_paper")
+
+dir.create(RES_H, showWarnings = FALSE, recursive = TRUE)
+dir.create(RES_M, showWarnings = FALSE, recursive = TRUE)
+
+set.seed(123)
+N_HVG <- 2000
+PCS   <- 30
+DIMS  <- 1:15
+RES   <- 0.5
+
+QC_MIN_GENES <- 500
+QC_MAX_GENES <- 6000
+QC_MAX_MT    <- 0.10
+
+## ---------------- 工具函数 ----------------
+
+get_sample_id <- function(file, species = c("human","mouse")) {
+  species <- match.arg(species)
+  bn <- basename(file)
+  m  <- regexpr(paste0(species, "[0-9]+"), bn, ignore.case = TRUE)
+  if (m > 0) {
+    id <- substr(bn, m, m + attr(m, "match.length") - 1)
+  } else {
+    id <- strsplit(bn, "_")[[1]][1]
+  }
+  id <- gsub("human","H",id,ignore.case = TRUE)
+  id <- gsub("mouse","M",id,ignore.case = TRUE)
+  id
+}
+
+read_baron_file <- function(file) {
+  message("Reading: ", basename(file))
+  DT <- fread(file, header = TRUE, check.names = FALSE, data.table = TRUE)
+
+  nm_raw <- names(DT)
+  nm_low <- tolower(trimws(nm_raw))
+
+  if (nm_low[1] %in% c("", "v1")) {
+    v1 <- DT[[1]]
+    if (all(is.na(v1) | v1 == "")) {
+      DT <- DT[, -1, with = FALSE]
+      nm_raw <- names(DT); nm_low <- tolower(trimws(nm_raw))
+    }
+  }
+
+  bcol <- which(nm_low == "barcode")
+  if (length(bcol) != 1) {
+    stop("未找到唯一 barcode 列：", paste(nm_raw, collapse = ", "))
+  }
+  barcodes <- as.character(DT[[bcol]])
+  keep <- !(is.na(barcodes) | barcodes == "")
+  if (any(!keep)) {
+    DT <- DT[keep]; barcodes <- barcodes[keep]
+  }
+  if (any(duplicated(barcodes))) {
+    keep2 <- !duplicated(barcodes)
+    DT   <- DT[keep2]; barcodes <- barcodes[keep2]
+  }
+
+  ccol <- which(nm_low == "assigned_cluster")
+  drop_idx <- unique(c(bcol, ccol))
+  expr_DT <- if (length(drop_idx) > 0) DT[, -drop_idx, with = FALSE] else DT
+
+  expr_DF <- as.data.frame(lapply(expr_DT, function(x)
+    suppressWarnings(as.numeric(as.character(x)))))
+  expr_DF[is.na(expr_DF)] <- 0
+
+  nz <- which(colSums(expr_DF) > 0)
+  expr_DF <- expr_DF[, nz, drop = FALSE]
+
+  M     <- as.matrix(expr_DF)    # 行=细胞, 列=基因
+  genes <- colnames(M)
+  if (is.null(genes)) genes <- paste0("gene_", seq_len(ncol(M)))
+
+  Mt <- t(M)                     # 基因×细胞
+  rownames(Mt) <- make.unique(genes)
+  colnames(Mt) <- make.unique(barcodes)
+
+  Matrix(Mt, sparse = TRUE)
+}
+
+merge_samples <- function(file_vec, species_label) {
+  mats   <- list()
+  sampid <- character(0)
+
+  for (i in seq_along(file_vec)) {
+    f   <- file_vec[i]
+    sid <- get_sample_id(f, species_label)
+    mat <- read_baron_file(f)
+    colnames(mat) <- paste(sid, colnames(mat), sep = "_")
+    mats[[i]]     <- mat
+    sampid[i]     <- sid
+  }
+
+  if (length(mats) > 1) {
+    g_common <- Reduce(intersect, lapply(mats, rownames))
+    mats <- lapply(mats, function(m) m[g_common, , drop = FALSE])
+  }
+
+  all_mat <- do.call(cbind, mats)
+
+  sample_vec <- unlist(mapply(
+    FUN = function(m, sid) rep(sid, ncol(m)),
+    m   = mats,
+    sid = sampid,
+    SIMPLIFY = FALSE
+  ))
+  names(sample_vec) <- colnames(all_mat)
+
+  list(mat = all_mat, sample = sample_vec)
+}
+
+mt_genes <- function(genes)  genes[grepl("^MT-|^mt-|^mt\\.", genes)]
+rb_genes <- function(genes)  genes[grepl("^RPL|^RPS|^rpl|^rps", genes)]
+
+mad_keep <- function(x, k = 3) {
+  med <- median(x, na.rm = TRUE)
+  md  <- mad(x, constant = 1.4826, na.rm = TRUE)
+  x >= (med - k * md) & x <= (med + k * md)
+}
+
+get_counts <- function(obj, assay = DefaultAssay(obj)) {
+  a <- obj[[assay]]
+  if ("layers" %in% slotNames(a)) {
+    GetAssayData(obj, assay = assay, layer = "counts")
+  } else {
+    GetAssayData(obj, assay = assay, slot  = "counts")
+  }
+}
+
+qc_and_make_seurat <- function(smat, species_label, sample_vec) {
+  message("====== QC & Seurat for ", species_label, " ======")
+
+  md <- data.frame(
+    row.names = colnames(smat),
+    species   = species_label,
+    sample    = sample_vec[colnames(smat)],
+    stringsAsFactors = FALSE
+  )
+
+  obj <- CreateSeuratObject(
+    counts   = smat,
+    project  = paste0("Baron_", species_label),
+    meta.data = md,
+    min.cells = 0,
+    min.features = 0
+  )
+  obj$orig.ident <- obj$sample
+
+  counts <- get_counts(obj)
+  genes  <- rownames(counts)
+
+  mt_set <- mt_genes(genes)
+  rb_set <- rb_genes(genes)
+
+  nFeature <- Matrix::colSums(counts > 0)
+  nCount   <- Matrix::colSums(counts)
+  pct_mt   <- if (length(mt_set) > 0)
+    Matrix::colSums(counts[mt_set, , drop = FALSE]) / pmax(nCount, 1) * 100 else rep(0, ncol(counts))
+  pct_rb   <- if (length(rb_set) > 0)
+    Matrix::colSums(counts[rb_set, , drop = FALSE]) / pmax(nCount, 1) * 100 else rep(0, ncol(counts))
+
+  obj$nFeature_RNA <- nFeature
+  obj$nCount_RNA   <- nCount
+  obj$percent.mt   <- pct_mt
+  obj$percent.ribo <- pct_rb
+
+  keep1 <- (nFeature >= QC_MIN_GENES) &
+           (nFeature <= QC_MAX_GENES) &
+           (pct_mt  <= QC_MAX_MT * 100)
+
+  keep2 <- rep(TRUE, ncol(obj))
+  for (id in unique(obj$sample)) {
+    idx <- which(obj$sample == id)
+    keep2[idx] <- mad_keep(nFeature[idx]) &
+                  mad_keep(nCount[idx]) &
+                  mad_keep(pct_mt[idx])
+  }
+  keep <- keep1 & keep2
+
+  message("Cells before QC: ", ncol(obj),
+          " | after QC: ", sum(keep))
+  obj <- subset(obj, cells = colnames(obj)[keep])
+
+  counts2    <- get_counts(obj)
+  keep_genes <- Matrix::rowSums(counts2 > 0) >= 3
+  obj        <- obj[keep_genes, ]
+
+  obj <- NormalizeData(obj, verbose = FALSE)
+  obj <- FindVariableFeatures(obj, nfeatures = N_HVG, verbose = FALSE)
+  obj <- ScaleData(obj, verbose = FALSE)
+  obj <- RunPCA(obj, npcs = PCS, verbose = FALSE)
+  obj <- FindNeighbors(obj, dims = DIMS)
+  obj <- FindClusters(obj, resolution = RES)
+  obj <- RunUMAP(obj, dims = DIMS, verbose = FALSE)
+  obj <- RunTSNE(obj, dims = DIMS, check_duplicates = FALSE)
+
+  obj
+}
+
+match_features <- function(obj, genes) {
+  rn   <- rownames(obj)
+  rn_l <- tolower(rn)
+  g_l  <- tolower(genes)
+  idx  <- match(g_l, rn_l)
+  found  <- rn[!is.na(idx)]
+  missed <- genes[is.na(idx)]
+  if (length(missed) > 0) {
+    message("以下基因没找到，将忽略：", paste(missed, collapse = ", "))
+  }
+  found
+}
+
+annotate_pancreas <- function(obj, marker_list, slot_name = "celltype_major") {
+  scored_lists <- lapply(marker_list, function(gs) match_features(obj, gs))
+  keep <- vapply(scored_lists, length, integer(1)) > 0
+  scored_lists <- scored_lists[keep]
+  if (length(scored_lists) == 0) stop("在此对象中 marker 都匹配不到。")
+
+  obj <- AddModuleScore(obj, features = scored_lists,
+                        name = paste0(slot_name, "_score"))
+  score_cols <- grep(paste0("^", slot_name, "_score"), colnames(obj@meta.data), value = TRUE)
+  score_mat  <- as.matrix(obj@meta.data[, score_cols, drop = FALSE])
+
+  max_idx  <- apply(score_mat, 1, which.max)
+  ct_names <- names(scored_lists)[max_idx]
+  max_val  <- apply(score_mat, 1, max)
+  ct_names[max_val < 0] <- "Unknown"
+
+  obj[[slot_name]] <- factor(ct_names)
+  obj
+}
+
+## ---------------- 1. 读入 human / mouse ----------------
+
+human_files <- list.files(RAW_DIR, pattern = "human.*\\.csv\\.gz$", full.names = TRUE)
+mouse_files <- list.files(RAW_DIR, pattern = "mouse.*\\.csv\\.gz$", full.names = TRUE)
+
+if (length(human_files) == 0) stop("没有找到 human*.csv.gz")
+if (length(mouse_files) == 0) warning("没有找到 mouse*.csv.gz，将只分析 human")
+
+human_m <- merge_samples(human_files, "human")
+human   <- qc_and_make_seurat(human_m$mat, "human", human_m$sample)
+
+mouse <- NULL
+if (length(mouse_files) > 0) {
+  mouse_m <- merge_samples(mouse_files, "mouse")
+  mouse   <- qc_and_make_seurat(mouse_m$mat, "mouse", mouse_m$sample)
+}
+
+## ---------------- 2. 注释 cell type ----------------
+
+pancreas_markers <- list(
+  Alpha      = c("GCG"),
+  Beta       = c("INS"),
+  Delta      = c("SST"),
+  PP         = c("PPY"),
+  Acinar     = c("PRSS1","CPA1"),
+  Ductal     = c("KRT19","MUC1","CFTR"),
+  Endothelial= c("PECAM1","VWF"),
+  Stellate   = c("COL1A1","RGS5"),
+  Immune     = c("PTPRC","LYZ","CD74")
+)
+
+human <- annotate_pancreas(human, pancreas_markers, slot_name = "celltype_major")
+human$celltype_final <- human$celltype_major
+
+if (!is.null(mouse)) {
+  mouse_markers <- list(
+    Alpha      = c("Gcg"),
+    Beta       = c("Ins1","Ins2"),
+    Delta      = c("Sst"),
+    PP         = c("Ppy"),
+    Acinar     = c("Prss1","Cpa1"),
+    Ductal     = c("Krt19","Muc1","Cftr"),
+    Endothelial= c("Pecam1","Vwf"),
+    Stellate   = c("Col1a1","Rgs5"),
+    Immune     = c("Ptprc","Lyz2")
+  )
+  mouse <- annotate_pancreas(mouse, mouse_markers, slot_name = "celltype_major")
+  mouse$celltype_final <- mouse$celltype_major
+}
+
+ct_order <- c("Alpha","Beta","Delta","PP","Ductal","Acinar",
+              "Endothelial","Stellate","Immune","Unknown")
+human$celltype_final <- factor(as.character(human$celltype_final), levels = ct_order)
+if (!is.null(mouse)) {
+  mouse$celltype_final <- factor(as.character(mouse$celltype_final), levels = ct_order)
+}
+
+## ---------------- 3. 保存结果 & 记录环境 ----------------
+
+saveRDS(human, file = file.path(RES_H, "Human_seurat_celltyped.rds"))
+if (!is.null(mouse)) {
+  saveRDS(mouse, file = file.path(RES_M, "Mouse_seurat_celltyped.rds"))
+}
+
+saveRDS(list(
+  cfg = list(
+    RAW_DIR = RAW_DIR,
+    N_HVG   = N_HVG,
+    PCS     = PCS,
+    DIMS    = DIMS,
+    RES     = RES,
+    QC_MIN_GENES = QC_MIN_GENES,
+    QC_MAX_GENES = QC_MAX_GENES,
+    QC_MAX_MT    = QC_MAX_MT
+  ),
+  session = sessionInfo()
+), file = file.path(RES_H, "run_metadata_build_seurat.rds"))
+
+message("✅ 01_build_seurat.R 完成。")

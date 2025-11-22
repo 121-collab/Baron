@@ -1,0 +1,266 @@
+#!/usr/bin/env Rscript
+
+## ============================================================
+## 04_fig3_ductal_fig4_beta_PCA.R
+## Fig3: ductal PCA / PC1 profiles
+## Fig4: beta PCA / PC1 profiles
+## ============================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(ggplot2)
+  library(pheatmap)
+  library(patchwork)
+  library(tidyr)
+})
+
+PROJECT_DIR <- "/data/projects/genebiotec_wushujun/Baron_GSE84133"
+RES_H       <- file.path(PROJECT_DIR, "results_human_paper")
+RES_M       <- file.path(PROJECT_DIR, "results_mouse_paper")
+
+human <- readRDS(file.path(RES_H, "Human_seurat_celltyped.rds"))
+mouse <- if (file.exists(file.path(RES_M, "Mouse_seurat_celltyped.rds"))) {
+  readRDS(file.path(RES_M, "Mouse_seurat_celltyped.rds"))
+} else NULL
+
+theme_baron <- function(base = 10){
+  theme_bw(base_size = base) +
+    theme(
+      panel.grid = element_blank(),
+      strip.background = element_rect(fill = "grey92", color = NA),
+      strip.text = element_text(face = "bold"),
+      plot.title = element_text(face = "bold", hjust = 0.5, size = base + 2),
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+    )
+}
+
+get_data <- function(obj, assay = DefaultAssay(obj)) {
+  a <- obj[[assay]]
+  if ("layers" %in% slotNames(a)) {
+    GetAssayData(obj, assay = assay, layer = "data")
+  } else {
+    GetAssayData(obj, assay = assay, slot  = "data")
+  }
+}
+
+match_features <- function(obj, genes) {
+  rn   <- rownames(obj)
+  rn_l <- tolower(rn)
+  g_l  <- tolower(genes)
+  idx  <- match(g_l, rn_l)
+  found  <- rn[!is.na(idx)]
+  missed <- genes[is.na(idx)]
+  if (length(missed) > 0) {
+    message("以下基因没找到，将忽略：", paste(missed, collapse = ", "))
+  }
+  found
+}
+
+moving_average_along_pc1 <- function(obj, genes,
+                                     n_bins = 30,
+                                     assay = "RNA") {
+  genes <- match_features(obj, genes)
+  if (length(genes) == 0) return(NULL)
+
+  pc1 <- Embeddings(obj, "pca")[, 1]
+  data_mat <- get_data(obj, assay = assay)
+  brks  <- seq(min(pc1), max(pc1), length.out = n_bins + 1)
+  bin_id <- cut(pc1, breaks = brks, include.lowest = TRUE, labels = FALSE)
+
+  profiles <- lapply(genes, function(g) {
+    tapply(as.numeric(data_mat[g, ]), bin_id, mean, na.rm = TRUE)
+  })
+  names(profiles) <- genes
+
+  prof_df <- as.data.frame(profiles)
+  prof_df$bin <- seq_len(nrow(prof_df))
+  prof_long <- pivot_longer(prof_df, cols = all_of(genes),
+                            names_to = "gene", values_to = "expr")
+  prof_long
+}
+
+pc1_heatmap <- function(obj, top_n = 40,
+                        assay = "RNA",
+                        n_bins = 30,
+                        title = "", file) {
+  loadings <- Loadings(obj[["pca"]])[, 1]
+  ord      <- order(abs(loadings), decreasing = TRUE)[1:top_n]
+  genes    <- names(loadings)[ord]
+  genes    <- match_features(obj, genes)
+  if (length(genes) == 0) return(invisible(NULL))
+
+  pc1 <- Embeddings(obj, "pca")[, 1]
+  data_mat <- get_data(obj, assay = assay)
+  brks  <- seq(min(pc1), max(pc1), length.out = n_bins + 1)
+  bin_id <- cut(pc1, breaks = brks, include.lowest = TRUE, labels = FALSE)
+
+  prof_list <- lapply(genes, function(g) {
+    tapply(as.numeric(data_mat[g, ]), bin_id, mean, na.rm = TRUE)
+  })
+  prof_mat <- do.call(cbind, prof_list)
+  rownames(prof_mat) <- paste0("bin", seq_len(nrow(prof_mat)))
+  colnames(prof_mat) <- genes
+  prof_scaled <- t(scale(t(prof_mat)))
+
+  pdf(file, width = 6, height = 6)
+  pheatmap(prof_scaled,
+           cluster_rows = FALSE,
+           cluster_cols = TRUE,
+           main = title, fontsize = 8)
+  dev.off()
+}
+
+## ---------------- Fig3: Human ductal ----------------
+
+duct_h <- subset(human, subset = celltype_final == "Ductal")
+message("Human ductal cells: ", ncol(duct_h))
+
+duct_h <- NormalizeData(duct_h, verbose = FALSE)
+duct_h <- FindVariableFeatures(duct_h, verbose = FALSE)
+duct_h <- ScaleData(duct_h, verbose = FALSE)
+duct_h <- RunPCA(duct_h, npcs = 30, verbose = FALSE)
+
+duct_genes_h <- c("MUC1","CFTR","TFF1","TFF2","CD44","PLAT")
+duct_genes_h <- match_features(duct_h, duct_genes_h)
+
+pdf(file.path(RES_H, "Human_Fig3A_Ductal_PCA_PC1_PC2.pdf"), width = 6, height = 5)
+p_list <- lapply(duct_genes_h, function(g){
+  FeaturePlot(duct_h, features = g, reduction = "pca",
+              dims = c(1,2), pt.size = 0.5) +
+    ggtitle(g) + theme_baron()
+})
+print(patchwork::wrap_plots(p_list, ncol = 3))
+dev.off()
+
+ma_duct <- moving_average_along_pc1(duct_h, duct_genes_h, n_bins = 30)
+if (!is.null(ma_duct)) {
+  pdf(file.path(RES_H, "Human_Fig3B_Ductal_PC1_Markers_MA.pdf"), width = 7, height = 5)
+  print(
+    ggplot(ma_duct, aes(x = bin, y = expr)) +
+      geom_line(color = "firebrick", linewidth = 0.7) +
+      facet_wrap(~ gene, scales = "free_y", ncol = 3) +
+      labs(x = "PC1 bin", y = "Mean log-normalized expression",
+           title = "Human ductal — moving average along PC1") +
+      theme_baron()
+  )
+  dev.off()
+  pc1_heatmap(duct_h, top_n = 40,
+              title = "Human ductal — genes with high PC1 loading",
+              file  = file.path(RES_H, "Human_Fig3C_Ductal_PC1_loading_heatmap.pdf"))
+}
+
+## ---------------- Fig4: Human Beta ----------------
+
+beta_h <- subset(human,
+                 subset = celltype_final == "Beta" & nCount_RNA >= 3000)
+beta_h <- NormalizeData(beta_h, verbose = FALSE)
+beta_h <- FindVariableFeatures(beta_h, verbose = FALSE)
+beta_h <- ScaleData(beta_h, verbose = FALSE)
+beta_h <- RunPCA(beta_h, npcs = 30, verbose = FALSE)
+
+pdf(file.path(RES_H, "Human_Fig4A_Beta_PCA_PC1_PC2_nCount.pdf"), width = 6, height = 5)
+print(
+  FeaturePlot(beta_h, features = "nCount_RNA",
+              reduction = "pca", dims = c(1,2)) +
+    ggtitle("Beta — PCA colored by nCount_RNA") +
+    theme_baron()
+)
+dev.off()
+
+beta_genes_h <- c("HSPA5","MAFA","HERPUD1","DDIT3","UCN3")
+ma_beta <- moving_average_along_pc1(beta_h, beta_genes_h, n_bins = 30)
+if (!is.null(ma_beta)) {
+  pdf(file.path(RES_H, "Human_Fig4B_Beta_PC1_Markers_MA.pdf"), width = 7, height = 5)
+  print(
+    ggplot(ma_beta, aes(x = bin, y = expr)) +
+      geom_line(color = "steelblue4", linewidth = 0.7) +
+      facet_wrap(~ gene, scales = "free_y", ncol = 5) +
+      labs(x = "PC1 bin", y = "Mean log-normalized expression",
+           title = "Beta — moving average along PC1") +
+      theme_baron()
+  )
+  dev.off()
+  pc1_heatmap(beta_h, top_n = 40,
+              title = "Beta — genes with high PC1 loading",
+              file  = file.path(RES_H, "Human_Fig4C_Beta_PC1_loading_heatmap.pdf"))
+}
+
+## ---------------- Mouse 端（可选） ----------------
+
+if (!is.null(mouse)) {
+  # Mouse ductal
+  duct_m <- subset(mouse, subset = celltype_final == "Ductal")
+  message("Mouse ductal cells: ", ncol(duct_m))
+
+  duct_m <- NormalizeData(duct_m, verbose = FALSE)
+  duct_m <- FindVariableFeatures(duct_m, verbose = FALSE)
+  duct_m <- ScaleData(duct_m, verbose = FALSE)
+  duct_m <- RunPCA(duct_m, npcs = 30, verbose = FALSE)
+
+  duct_genes_m <- c("Muc1","Cftr","Tff1","Tff2","Cd44","Plat")
+  duct_genes_m <- match_features(duct_m, duct_genes_m)
+
+  pdf(file.path(RES_M, "Mouse_Fig3A_Ductal_PCA_PC1_PC2.pdf"), width = 6, height = 5)
+  p_list_m <- lapply(duct_genes_m, function(g){
+    FeaturePlot(duct_m, features = g, reduction = "pca",
+                dims = c(1,2), pt.size = 0.5) +
+      ggtitle(g) + theme_baron()
+  })
+  print(patchwork::wrap_plots(p_list_m, ncol = 3))
+  dev.off()
+
+  ma_duct_m <- moving_average_along_pc1(duct_m, duct_genes_m, n_bins = 30)
+  if (!is.null(ma_duct_m)) {
+    pdf(file.path(RES_M, "Mouse_Fig3B_Ductal_PC1_Markers_MA.pdf"), width = 7, height = 5)
+    print(
+      ggplot(ma_duct_m, aes(x = bin, y = expr)) +
+        geom_line(color = "firebrick", linewidth = 0.7) +
+        facet_wrap(~ gene, scales = "free_y", ncol = 3) +
+        labs(x = "PC1 bin", y = "Mean log-normalized expression",
+             title = "Mouse ductal — moving average along PC1") +
+        theme_baron()
+    )
+    dev.off()
+    pc1_heatmap(duct_m, top_n = 40,
+                title = "Mouse ductal — genes with high PC1 loading",
+                file  = file.path(RES_M, "Mouse_Fig3C_Ductal_PC1_loading_heatmap.pdf"))
+  }
+
+  # Mouse beta
+  beta_m <- subset(mouse,
+                   subset = celltype_final == "Beta" & nCount_RNA >= 3000)
+  beta_m <- NormalizeData(beta_m, verbose = FALSE)
+  beta_m <- FindVariableFeatures(beta_m, verbose = FALSE)
+  beta_m <- ScaleData(beta_m, verbose = FALSE)
+  beta_m <- RunPCA(beta_m, npcs = 30, verbose = FALSE)
+
+  pdf(file.path(RES_M, "Mouse_Fig4A_Beta_PCA_PC1_PC2_nCount.pdf"), width = 6, height = 5)
+  print(
+    FeaturePlot(beta_m, features = "nCount_RNA",
+                reduction = "pca", dims = c(1,2)) +
+      ggtitle("Mouse Beta — PCA colored by nCount_RNA") +
+      theme_baron()
+  )
+  dev.off()
+
+  beta_genes_m <- c("Hspa5","Mafa","Herpud1","Ddit3","Fcn3")
+  ma_beta_m <- moving_average_along_pc1(beta_m, beta_genes_m, n_bins = 30)
+  if (!is.null(ma_beta_m)) {
+    pdf(file.path(RES_M, "Mouse_Fig4B_Beta_PC1_Markers_MA.pdf"), width = 7, height = 5)
+    print(
+      ggplot(ma_beta_m, aes(x = bin, y = expr)) +
+        geom_line(color = "steelblue4", linewidth = 0.7) +
+        facet_wrap(~ gene, scales = "free_y", ncol = 5) +
+        labs(x = "PC1 bin", y = "Mean log-normalized expression",
+             title = "Mouse Beta — moving average along PC1") +
+        theme_baron()
+    )
+    dev.off()
+    pc1_heatmap(beta_m, top_n = 40,
+                title = "Mouse Beta — genes with high PC1 loading",
+                file  = file.path(RES_M, "Mouse_Fig4C_Beta_PC1_loading_heatmap.pdf"))
+  }
+}
+
+message("✅ 04_fig3_ductal_fig4_beta_PCA.R 完成。")

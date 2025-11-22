@@ -1,0 +1,102 @@
+#!/usr/bin/env Rscript
+
+## ============================================================
+## 03_fig2_corr.R
+## Fig2: donor × celltype Pearson correlation heatmaps
+## ============================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(pheatmap)
+})
+
+PROJECT_DIR <- "/data/projects/genebiotec_wushujun/Baron_GSE84133"
+RES_H       <- file.path(PROJECT_DIR, "results_human_paper")
+RES_M       <- file.path(PROJECT_DIR, "results_mouse_paper")
+
+human <- readRDS(file.path(RES_H, "Human_seurat_celltyped.rds"))
+mouse <- if (file.exists(file.path(RES_M, "Mouse_seurat_celltyped.rds"))) {
+  readRDS(file.path(RES_M, "Mouse_seurat_celltyped.rds"))
+} else NULL
+
+get_data <- function(obj, assay = DefaultAssay(obj)) {
+  a <- obj[[assay]]
+  if ("layers" %in% slotNames(a)) {
+    GetAssayData(obj, assay = assay, layer = "data")
+  } else {
+    GetAssayData(obj, assay = assay, slot  = "data")
+  }
+}
+
+avg_by_donor_celltype <- function(obj,
+                                  celltype_col = "celltype_final",
+                                  assay = "RNA") {
+  mat <- get_data(obj, assay = assay)
+  md  <- obj@meta.data
+  group <- paste(md$sample, md[[celltype_col]], sep = "_")
+  groups <- unique(group)
+
+  res_list <- lapply(groups, function(g) {
+    cells <- colnames(mat)[group == g]
+    if (length(cells) < 3) return(NULL)
+    rowMeans(mat[, cells, drop = FALSE])
+  })
+  names(res_list) <- groups
+  res_list <- res_list[!vapply(res_list, is.null, logical(1))]
+  res_mat  <- do.call(cbind, res_list)
+  colnames(res_mat) <- names(res_list)
+  res_mat
+}
+
+plot_corr_heatmap <- function(avg_mat, file, title = ""){
+  cormat <- cor(avg_mat, method = "pearson", use = "pairwise.complete.obs")
+  tmp    <- strsplit(colnames(cormat), "_")
+  donor  <- sapply(tmp, `[`, 1)
+  ctype  <- sapply(tmp, `[`, 2)
+  anno   <- data.frame(donor = donor, celltype = ctype,
+                       row.names = colnames(cormat))
+  pdf(file, width = 7, height = 6)
+  pheatmap(cormat,
+           clustering_method = "average",
+           annotation_row = anno,
+           annotation_col = anno,
+           color = colorRampPalette(c("#4575B4","#E0F3F8",
+                                      "#FFFFBF","#FEE090","#D73027"))(100),
+           treeheight_row = 10, treeheight_col = 10,
+           fontsize = 9, main = title)
+  dev.off()
+}
+
+## Human Fig2A
+avg_h <- avg_by_donor_celltype(human)
+plot_corr_heatmap(avg_h,
+                  file.path(RES_H, "Human_Fig2A_donor_celltype_corr_heatmap.pdf"),
+                  "Human donor × cell type — Pearson correlation")
+
+## Mouse Fig2C + Human+Mouse 合并
+if (!is.null(mouse)) {
+  avg_m <- avg_by_donor_celltype(mouse)
+
+  plot_corr_heatmap(avg_m,
+                    file.path(RES_M, "Mouse_Fig2C_donor_celltype_corr_heatmap.pdf"),
+                    "Mouse donor × cell type — Pearson correlation")
+
+  get_ct <- function(x) sapply(strsplit(colnames(x), "_"), `[`, 2)
+  ct_h <- get_ct(avg_h)
+  ct_m <- get_ct(avg_m)
+  common_ct <- intersect(unique(ct_h), unique(ct_m))
+
+  avg_h2 <- avg_h[, ct_h %in% common_ct, drop = FALSE]
+  avg_m2 <- avg_m[, ct_m %in% common_ct, drop = FALSE]
+
+  colnames(avg_h2) <- paste0("H_", colnames(avg_h2))
+  colnames(avg_m2) <- paste0("M_", colnames(avg_m2))
+  avg_all <- cbind(avg_h2, avg_m2)
+
+  plot_corr_heatmap(avg_all,
+                    file.path(RES_H,
+                              "Human_Mouse_Fig2_commonCT_corr_heatmap.pdf"),
+                    "Human + Mouse common cell types — Pearson correlation")
+}
+
+message("✅ 03_fig2_corr.R 完成。")
